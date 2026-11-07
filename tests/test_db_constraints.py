@@ -1,8 +1,3 @@
-"""PT-16: обмеження цілісності БД (схема v1.0).
-
-Кожен тест працює з власною тимчасовою БД (tmp_path), тому не залежить від
-`python scripts/init_db.py` і не чіпає робочу data/peacetalk.db.
-"""
 import re
 import sqlite3
 
@@ -129,5 +124,5 @@ class TestSchemaV2:
         ).fetchone()
         assert (review_status, reviewed_by, reviewed_at) == ("APPROVED", None, None)
 
-    def test_schema_version_is_2(self, conn):
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    def test_schema_version_is_3(self, conn):
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3

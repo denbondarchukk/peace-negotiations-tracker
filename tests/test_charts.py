@@ -1,4 +1,3 @@
-"""Макет графіків: захист від накладань підписів, легенди й кнопок періоду."""
 import pandas as pd
 import pytest
 
@@ -71,6 +70,30 @@ def test_trend_works_without_notes_and_annotations(data):
     df, arts, notes, ann = data
     fig = charts.trend_figure(df, arts, notes.iloc[0:0], ann.iloc[0:0])
     assert names(fig) == ["Середнє за місяць", "Тренд (3 міс.)"]
+
+
+def test_overall_trend_has_separate_source_lines(data):
+    df, arts, notes, ann = data
+    radio = arts.copy()
+    radio["source"] = "radio_svoboda"
+    radio["overall_sentiment"] = radio["overall_sentiment"] + 0.3
+    bbc = arts.copy()
+    bbc["source"] = "bbc"
+    combined = pd.concat([bbc, radio], ignore_index=True)
+    missing = (
+        ((combined["source"] == "bbc") & combined["month"].between("2023-03-01", "2023-05-01"))
+        | ((combined["source"] == "radio_svoboda") & combined["month"].between("2023-04-01", "2023-06-01"))
+    )
+    combined = combined[~missing]
+
+    fig = charts.trend_figure(df, combined, notes.iloc[0:0], ann.iloc[0:0])
+
+    trends = {trace.name: trace for trace in fig.data if trace.mode == "lines"}
+    assert set(trends) == {"BBC · тренд (3 міс.)", "Радіо Свобода · тренд (3 міс.)"}
+    assert all(trace.connectgaps for trace in trends.values())
+    assert any(pd.isna(value) for value in trends["BBC · тренд (3 міс.)"].y)
+    assert any(pd.isna(value) for value in trends["Радіо Свобода · тренд (3 міс.)"].y)
+    assert list(trends["BBC · тренд (3 міс.)"].y) != list(trends["Радіо Свобода · тренд (3 міс.)"].y)
 
 
 def test_heatmap_uses_ukrainian_labels(data):

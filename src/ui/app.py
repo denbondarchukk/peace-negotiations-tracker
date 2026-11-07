@@ -20,9 +20,10 @@ from src.errors import (
     AccessDenied, ConflictError, NoteError, NotFoundError, TechnicalFailure, ValidationError,
 )
 from src.ops import observed, record, utc_now, utc_now_iso
+from src.ui import compare_charts as cmp
 from src.ui.charts import (
-    CAT_LABEL, CATEGORIES, VIEW_CATEGORIES, VIEW_OVERALL, heatmap_figure, period_tone_figure, trend_figure,
-    year_share_figure, year_violin_figure,
+    CAT_LABEL, CATEGORIES, VIEW_CATEGORIES, VIEW_OVERALL, articles_for_cell, cell_from_event, heatmap_figure,
+    period_tone_figure, trend_figure, year_share_figure, year_violin_figure,
 )
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -74,6 +75,7 @@ REVIEW_BADGE = {
     "PENDING_APPROVAL": ":orange-badge[На розгляді]",
     "REJECTED": ":red-badge[Відхилено]",
 }
+SOURCE_LABELS = {"bbc": "BBC", "radio_svoboda": "Радіо Свобода", "all": "Усі джерела"}
 TREND_BADGE = {
     "escalation": ":red-badge[Ескалація]",
     "compromise": ":green-badge[Компроміс]",
@@ -88,26 +90,35 @@ def get_connection():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 
+def _assessment_scope(start_date: str, end_date: str, categories: tuple, sources: tuple) -> tuple[str, list]:
+    """WHERE-умова за датою, категоріями й джерелами (без порогу впевненості) + її параметри."""
+    where = "a.date >= ? AND a.date <= ?"
+    params: list = [start_date, end_date]
+    if categories:
+        where += f" AND ar.metric_category IN ({','.join('?' * len(categories))})"
+        params += list(categories)
+    if sources:
+        where += f" AND a.source IN ({','.join('?' * len(sources))})"
+        params += list(sources)
+    return where, params
+
+
+# Усі аргументи (зокрема min_confidence) входять у ключ кешу st.cache_data, тому інший поріг
+# дає окремий запис кешу, а не застарілий результат (PT-74).
 @st.cache_data(ttl=30, show_spinner=False)
 def load_assessments(start_date: str, end_date: str, categories: tuple,
                      sources: tuple, min_confidence: float) -> pd.DataFrame:
-    query = """
+    where, params = _assessment_scope(start_date, end_date, categories, sources)
+    query = f"""
         SELECT a.id AS article_id, a.source, a.title, a.date, a.url,
                ar.metric_category, ar.score, ar.justification, ar.confidence,
                ar.overall_sentiment, ar.is_compromise_oriented
         FROM assessment_records ar
         JOIN news_articles a ON ar.article_id = a.id
         WHERE (ar.confidence IS NULL OR ar.confidence >= ?)
-          AND a.date >= ? AND a.date <= ?
+          AND {where}
     """
-    params: list = [min_confidence, start_date, end_date]
-    if categories:
-        query += f" AND ar.metric_category IN ({','.join('?' * len(categories))})"
-        params += list(categories)
-    if sources:
-        query += f" AND a.source IN ({','.join('?' * len(sources))})"
-        params += list(sources)
-    df = pd.read_sql_query(query + " ORDER BY a.date", get_connection(), params=params)
+    df = pd.read_sql_query(query + " ORDER BY a.date", get_connection(), params=[min_confidence, *params])
     df["date"] = pd.to_datetime(df["date"])
     df["month"] = df["date"].dt.to_period("M").dt.to_timestamp()
     df["is_compromise_oriented"] = df["is_compromise_oriented"].astype(bool)
@@ -115,10 +126,28 @@ def load_assessments(start_date: str, end_date: str, categories: tuple,
 
 
 @st.cache_data(ttl=30, show_spinner=False)
+def count_hidden_assessments(start_date: str, end_date: str, categories: tuple,
+                             sources: tuple, min_confidence: float) -> tuple[int, int]:
+    """(приховано, усього) оцінок за поточними фільтрами. Приховані — ті, що нижчі за поріг."""
+    where, params = _assessment_scope(start_date, end_date, categories, sources)
+    row = get_connection().execute(
+        f"""
+        SELECT COUNT(*),
+               COALESCE(SUM(ar.confidence IS NOT NULL AND ar.confidence < ?), 0)
+        FROM assessment_records ar
+        JOIN news_articles a ON ar.article_id = a.id
+        WHERE {where}
+        """,
+        [min_confidence, *params],
+    ).fetchone()
+    return int(row[1]), int(row[0])
+
+
+@st.cache_data(ttl=30, show_spinner=False)
 def load_expert_notes(start_date: str | None = None, end_date: str | None = None,
-                      categories: tuple = (), statuses: tuple = ()) -> pd.DataFrame:
+                      categories: tuple = (), statuses: tuple = (), sources: tuple = ()) -> pd.DataFrame:
     query = """
-        SELECT id, event_date, metric_category, content, author_id, importance_type, status,
+        SELECT id, event_date, metric_category, content, author_id, source, importance_type, status,
                created_at, updated_at, review_status, reviewed_by, reviewed_at
         FROM expert_notes WHERE 1=1
     """
@@ -135,13 +164,16 @@ def load_expert_notes(start_date: str | None = None, end_date: str | None = None
     if statuses:
         query += f" AND status IN ({','.join('?' * len(statuses))})"
         params += list(statuses)
+    if sources:
+        query += f" AND source IN ({','.join('?' * len(sources))})"
+        params += list(sources)
     return pd.read_sql_query(query + " ORDER BY event_date DESC, id DESC", get_connection(), params=params)
 
 
 @st.cache_data(ttl=30, show_spinner=False)
 def load_pending_notes() -> pd.DataFrame:
     query = """
-        SELECT id, event_date, metric_category, content, author_id, importance_type, status,
+        SELECT id, event_date, metric_category, content, author_id, source, importance_type, status,
                created_at, updated_at, review_status
         FROM expert_notes 
         WHERE status = 'PUBLISHED' AND review_status = 'PENDING_APPROVAL'
@@ -166,14 +198,17 @@ def get_article_text(article_id: str) -> str:
     return (row[0] if row and row[0] else "")
 
 
-SUMMARY_COLUMNS = ["period", "trend", "summary", "articles_count", "avg_sentiment", "model", "created_at"]
-ANNOTATION_COLUMNS = ["period", "article_id", "kind", "text", "date", "title", "url", "overall_sentiment"]
+SUMMARY_COLUMNS = ["source", "period", "trend", "summary", "articles_count", "avg_sentiment", "model", "created_at"]
+ANNOTATION_COLUMNS = [
+    "source", "period", "article_id", "kind", "text", "date", "title", "url", "overall_sentiment",
+]
 
 
 @st.cache_data(ttl=30, show_spinner=False)
 def load_summaries() -> pd.DataFrame:
     try:
-        return pd.read_sql_query(f"SELECT {', '.join(SUMMARY_COLUMNS)} FROM period_summaries ORDER BY period DESC",
+        return pd.read_sql_query(f"SELECT {', '.join(SUMMARY_COLUMNS)} FROM period_summaries "
+                                 "ORDER BY period DESC, source",
                                  get_connection())
     except (sqlite3.OperationalError, pd.errors.DatabaseError):
         return pd.DataFrame(columns=SUMMARY_COLUMNS)
@@ -182,7 +217,7 @@ def load_summaries() -> pd.DataFrame:
 @st.cache_data(ttl=30, show_spinner=False)
 def load_annotations() -> pd.DataFrame:
     query = """
-        SELECT s.period, s.article_id, s.kind, s.text, a.date, a.title, a.url,
+        SELECT s.source, s.period, s.article_id, s.kind, s.text, a.date, a.title, a.url,
                (SELECT MAX(overall_sentiment) FROM assessment_records WHERE article_id = a.id) AS overall_sentiment
         FROM summary_annotations s JOIN news_articles a ON a.id = s.article_id
         ORDER BY a.date
@@ -239,11 +274,13 @@ def _clean_content(content: str) -> str:
     return content
 
 
-def _validate_new_note(event_date: str, metric_category: str, importance_type: str) -> None:
+def _validate_new_note(event_date: str, metric_category: str, importance_type: str, source: str) -> None:
     if metric_category not in CATEGORIES:
         raise ValidationError("Невідома категорія")
     if importance_type not in IMPORTANCE_TYPES:
         raise ValidationError("Невідомий тип замітки")
+    if not isinstance(source, str) or not source.strip() or len(source) > 50:
+        raise ValidationError("Невідоме джерело замітки")
     try:
         parsed = date.fromisoformat(event_date)
     except (TypeError, ValueError):
@@ -254,10 +291,10 @@ def _validate_new_note(event_date: str, metric_category: str, importance_type: s
 
 @observed("create_note")
 def create_note(user_id: str, event_date: str, metric_category: str,
-                content: str, importance_type: str = "COMMENT") -> int:
+                content: str, importance_type: str = "COMMENT", source: str = "bbc") -> int:
     """Створює замітку; офіційні заяви очікують схвалення адміністратора."""
     content = _clean_content(content)
-    _validate_new_note(event_date, metric_category, importance_type)
+    _validate_new_note(event_date, metric_category, importance_type, source)
 
     review_status = "PENDING_APPROVAL" if importance_type == "OFFICIALSTATEMENT" else "APPROVED"
 
@@ -266,9 +303,11 @@ def create_note(user_id: str, event_date: str, metric_category: str,
         with _write_conn() as conn:
             cur = conn.execute(
                 """INSERT INTO expert_notes
-                   (event_date, metric_category, content, author_id, importance_type, status, created_at, updated_at, review_status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (event_date, metric_category, content, user_id, importance_type, ACTIVE, now, now, review_status),
+                   (event_date, metric_category, content, author_id, source, importance_type,
+                    status, created_at, updated_at, review_status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (event_date, metric_category, content, user_id, source, importance_type,
+                 ACTIVE, now, now, review_status),
             )
             return cur.lastrowid
     except sqlite3.IntegrityError:
@@ -487,9 +526,18 @@ def sidebar_filters(options: dict) -> dict:
             "Мін. впевненість моделі", 0.0, 1.0, 0.0, 0.05, key="f_conf",
             help="Оцінки без значення впевненості (старі дані) показуються завжди.",
         )
+        # round: слайдер із кроком 0.05 може дати 0.15000000000000002, і оцінка 0.15 «випала б»
+        min_conf = round(float(min_conf), 2)
+        hidden, total = count_hidden_assessments(
+            start.isoformat(), end.isoformat(), tuple(cats), tuple(srcs), min_conf,
+        )
+        note = f"Приховано **{hidden}** із **{total}** оцінок"
+        if total and hidden == total:
+            note += " — усі приховано, зменште поріг"
+        st.caption(note)
     return {
         "start": start.isoformat(), "end": end.isoformat(),
-        "categories": tuple(cats), "sources": tuple(srcs), "min_confidence": float(min_conf),
+        "categories": tuple(cats), "sources": tuple(srcs), "min_confidence": min_conf,
     }
 
 
@@ -522,13 +570,70 @@ def trend_section(df: pd.DataFrame, arts: pd.DataFrame, notes: pd.DataFrame, ann
         show_ann = st.toggle("Анотації агента", value=True, key="trend_ann")
     fig = trend_figure(df, arts, notes, annotations, view, window, show_notes, show_ann)
     st.plotly_chart(fig, width="stretch", config={"displaylogo": False})
+    st.caption("Маркери показують лише доступні значення; для порожніх місяців окремі точки не додаються.")
+
+
+@st.fragment
+def heatmap_section(df: pd.DataFrame) -> None:
+    """Теплова карта: клік по клітинці (або вибір категорії й місяця нижче) показує її статті."""
+    selected = None
+    if st.session_state.get("heat_cat") and st.session_state.get("heat_month") is not None:
+        selected = (st.session_state["heat_cat"], st.session_state["heat_month"])
+    st.plotly_chart(
+        heatmap_figure(df, selected_cell=selected), width="stretch", config={"displaylogo": False},
+        key="heatmap", on_select=_heatmap_selection_changed, selection_mode="points",
+    )
+    cats = [c for c in CATEGORIES if c in set(df["metric_category"])]
+    months = sorted(pd.to_datetime(df["month"].unique()))
+
+    for key, options in (("heat_cat", cats), ("heat_month", months)):
+        if key in st.session_state and st.session_state[key] not in options:
+            st.session_state[key] = None  # фільтри змінились, і вибраної клітинки вже немає
+
+    c1, c2 = st.columns(2)
+    cat = c1.selectbox("Категорія", cats, index=None, key="heat_cat", format_func=lambda c: CAT_LABEL[c],
+                       placeholder="Клікніть клітинку на карті або оберіть тут")
+    month = c2.selectbox("Місяць", months, index=None, key="heat_month", format_func=lambda m: f"{m:%m.%Y}",
+                         placeholder="Клікніть клітинку на карті або оберіть тут")
+    if not (cat and month):
+        st.caption("Клікніть клітинку, щоб побачити статті, з яких складено її колір.")
+        return
+
+    rows = articles_for_cell(df, cat, month)
+    if rows.empty:
+        st.info("У цій клітинці немає статей за поточними фільтрами.", icon=":material/filter_alt_off:")
+        return
+    avg = float(rows["score"].mean())
+    st.markdown(f"**{CAT_LABEL[cat]} · {month:%m.%Y}**: статей {len(rows)}, середня оцінка "
+                f":{score_color(avg)}-badge[{avg:+.2f}] (колір клітинки)")
+    for _, r in rows.iterrows():
+        with st.container(border=True):
+            st.markdown(f"[{r['title']}]({r['url']})")
+            conf = "" if pd.isna(r["confidence"]) else f" :gray-badge[впевненість {r['confidence']:.2f}]"
+            st.markdown(f":gray-badge[{r['date']:%d.%m.%Y}] :gray-badge[{r['source'].upper()}] "
+                        f":{score_color(r['score'])}-badge[{r['score']:+.2f}]{conf}")
+            if r["justification"]:
+                st.caption(r["justification"])
+
+
+def _apply_heatmap_selection(event) -> None:
+    clicked = cell_from_event(event)
+    if clicked is None:
+        st.session_state.pop("_heat_applied", None)
+    elif clicked != st.session_state.get("_heat_applied"):
+        st.session_state["_heat_applied"] = clicked
+        st.session_state["heat_cat"], st.session_state["heat_month"] = clicked
+
+
+def _heatmap_selection_changed() -> None:
+    _apply_heatmap_selection(st.session_state.get("heatmap"))
 
 
 def dashboard_page() -> None:
     f = ctx()["filters"]
     df, arts = current_filtered_data()
     # Показуємо тільки схвалені замітки
-    notes = load_expert_notes(f["start"], f["end"], f["categories"], (ACTIVE,))
+    notes = load_expert_notes(f["start"], f["end"], f["categories"], (ACTIVE,), f["sources"])
     # Додатковий фільтр по схваленню: review_status must be APPROVED
     notes = notes[notes['review_status'] == 'APPROVED']
 
@@ -556,12 +661,16 @@ def dashboard_page() -> None:
     k4.metric("Експертних заміток", len(notes), border=True,
               help="Активні (опубліковані) замітки в обраному періоді.")
 
-    trend_section(df, arts, notes, _visible_annotations(arts))
-
-    t_heat, t_year, t_extreme = st.tabs([":material/grid_on: Теплова карта", ":material/bar_chart: По роках",
-                                         ":material/swap_vert: Екстремуми"])
+    t_compare, t_heat, t_year, t_extreme = st.tabs([
+        ":material/compare_arrows: Динаміка",  # було: "Порівняння джерел"
+        ":material/grid_on: Теплова карта",
+        ":material/bar_chart: По роках",
+        ":material/swap_vert: Екстремуми",
+    ])
+    with t_compare:
+        trend_section(df, arts, notes, _visible_annotations(arts))
     with t_heat:
-        st.plotly_chart(heatmap_figure(df), width="stretch", config={"displaylogo": False})
+        heatmap_section(df)
     with t_year:
         ca, cb = st.columns(2)
         ca.plotly_chart(year_share_figure(arts), width="stretch", config={"displaylogo": False})
@@ -579,6 +688,234 @@ def dashboard_page() -> None:
                         st.markdown(f"[{r['title']}]({r['url']})")
                         st.markdown(f":gray-badge[{r['date']:%d.%m.%Y}] :gray-badge[{r['source'].upper()}] "
                                     f":{score_color(r['overall_sentiment'])}-badge[{r['overall_sentiment']:+.2f}]")
+
+
+#  Сторінка 2: Порівняння джерел
+PLOT_CONFIG = {"displaylogo": False}
+CMP_DISCLAIMER = (
+    "· Δ — різниця між джерелами (Радіо Свобода - BBC); колір показує, у якого джерела значення вище "
+    "· зірочка (*) позначає різницю за межами 95% довірчого інтервалу."
+)
+
+
+def _cmp_card_css() -> str:
+    """Підсвічування карток кольором джерела з вищим значенням і перенос довгих назв."""
+    rules = [
+        ".cmp-delta{font-size:clamp(1.25rem,2.2vw,1.75rem);font-weight:600;line-height:1.2;white-space:nowrap}",
+        ".cmp-lead{font-size:0.85rem;font-weight:600}",
+    ]
+    for src in cmp.SOURCES:
+        color = cmp.SOURCE_COLORS[src]
+        rules.append(f'[class*="st-key-cmp_card_{src}_"]{{border-color:{color} !important;'
+                     f"background:{cmp._rgba(color, 0.08)};box-shadow:inset 4px 0 0 {color}}}")
+        rules.append(f'[class*="st-key-cmp_card_{src}_"] .cmp-delta,'
+                     f'[class*="st-key-cmp_card_{src}_"] .cmp-lead{{color:{color}}}')
+    return "<style>" + "".join(rules) + "</style>"
+
+
+def _cmp_card_head(label: str, value: str, help_text: str) -> None:
+    # Назва звичайним markdown, а не підписом st.metric: так вона переноситься, а не обрізається.
+    st.markdown(f"**{label}**", help=help_text)
+    st.markdown(f"<div class='cmp-delta'>{value}</div>", unsafe_allow_html=True)
+
+
+def _cmp_metric_card(col, idx: int, metric: "cmp.Metric") -> None:
+    lead = cmp.leader(metric.gap)
+    with col, st.container(border=True, key=f"cmp_card_{lead or 'even'}_{idx}"):
+        _cmp_card_head(metric.label, cmp.fmt_delta(metric.gap, metric.fmt), metric.help)
+        st.markdown(f"<div class='cmp-lead'>{cmp.HIGHER_IN[lead] if lead else 'однаково'}</div>",
+                    unsafe_allow_html=True)
+        st.markdown(f":blue-badge[BBC {cmp.fmt_val(metric.a, metric.fmt)}] "
+                    f":orange-badge[Свобода {cmp.fmt_val(metric.b, metric.fmt)}]")
+        if metric.half is None:
+            st.caption("описова характеристика")
+        elif metric.significant:
+            st.markdown(":violet-badge[помітна різниця]")
+        else:
+            st.markdown(":gray-badge[в межах похибки]")
+
+
+def _cmp_correlation_card(col, arts: pd.DataFrame) -> None:
+    corr = cmp.dynamics_correlation(arts)
+    with col, st.container(border=True):
+        help_text = "Кореляція Пірсона між піврічними середніми тону двох джерел"
+        if corr is None:
+            _cmp_card_head("Узгодженість динаміки", "—", help_text)
+            st.caption("замало піврічних періодів")
+            return
+        r, n = corr
+        _cmp_card_head("Узгодженість динаміки", f"r = {r:+.2f}", help_text)
+        st.markdown(f":violet-badge[{cmp.correlation_word(r)}]")
+        st.caption(f"за {n} піврічними періодами")
+
+
+@st.fragment
+def cmp_trend_section(arts: pd.DataFrame) -> None:
+    c1, c2, _ = st.columns([2, 2, 3], vertical_alignment="bottom")
+    with c1:
+        label = st.segmented_control("Крок часу", list(cmp.GRANULARITY), default="Півріччя",
+                                     key="cmp_gran") or "Півріччя"
+    with c2:
+        dots = st.toggle("Окремі статті", key="cmp_dots", help="Показати кожну статтю точкою; при наведенні видно заголовок.")
+    st.plotly_chart(cmp.trend_gap_figure(arts, cmp.GRANULARITY[label], dots), width="stretch", config=PLOT_CONFIG)
+    st.caption("Заливка між лініями: помаранчева — тон вищий у Радіо Свобода, синя — у BBC. Розмір маркера — "
+               "кількість статей у періоді. Лінії з’єднують наявні спостереження; у порожніх періодах окремих точок немає. "
+               "У піврічному кроці обидва джерела представлені порівнянною добіркою.")
+
+
+@st.fragment
+def cmp_category_section(df: pd.DataFrame) -> None:
+    key = st.segmented_control("Критерій", list(cmp.CRITERIA), default="direction", key="cmp_criterion",
+                               format_func=lambda k: cmp.CRITERIA[k]["label"]) or "direction"
+    table = cmp.category_table(df, key)
+    if table.empty:
+        empty_state()
+        return
+    c1, c2 = st.columns(2)
+    c1.plotly_chart(cmp.radar_figure(table, key), width="stretch", config=PLOT_CONFIG)
+    c2.plotly_chart(cmp.dumbbell_figure(table, key), width="stretch", config=PLOT_CONFIG)
+    st.caption(f"{cmp.CRITERIA[key]['about']} Вуса на правому графіку — 95% довірчий інтервал.")
+
+
+def _cmp_heat_selected() -> None:
+    clicked = cmp.cell_from_event(st.session_state.get("cmp_heatmap"))
+    if clicked is None:
+        st.session_state.pop("_cmp_heat_applied", None)
+    elif clicked != st.session_state.get("_cmp_heat_applied"):
+        st.session_state["_cmp_heat_applied"] = clicked
+        st.session_state["cmp_heat_cat"], st.session_state["cmp_heat_period"] = clicked
+
+
+def _cmp_article_card(r: pd.Series) -> None:
+    with st.container(border=True):
+        st.markdown(f"[{r['title']}]({r['url']})")
+        conf = "" if pd.isna(r["confidence"]) else f" :gray-badge[впевненість {r['confidence']:.2f}]"
+        st.markdown(f":gray-badge[{r['date']:%d.%m.%Y}] :{score_color(r['score'])}-badge[{r['score']:+.2f}]{conf}")
+        if r["justification"]:
+            st.caption(r["justification"])
+
+
+@st.fragment
+def cmp_heatmap_section(df: pd.DataFrame) -> None:
+    """Теплова карта різниці: клік по клітинці показує статті обох джерел поруч."""
+    mode = st.segmented_control("Показати", list(cmp.HEAT_MODES), default=cmp.HEAT_DIFF,
+                                key="cmp_heat_mode") or cmp.HEAT_DIFF
+    selected = None
+    if st.session_state.get("cmp_heat_cat") and st.session_state.get("cmp_heat_period"):
+        selected = (st.session_state["cmp_heat_cat"], st.session_state["cmp_heat_period"])
+    st.plotly_chart(cmp.heatmap_figure(df, mode, selected), width="stretch", config=PLOT_CONFIG,
+                    key="cmp_heatmap", on_select=_cmp_heat_selected, selection_mode="points")
+    cats = [c for c in CATEGORIES if c in set(df["metric_category"])]
+    periods = cmp.heatmap_grid(df)["periods"]
+    for key, options in (("cmp_heat_cat", cats), ("cmp_heat_period", periods)):
+        if st.session_state.get(key) not in options:
+            st.session_state[key] = None  # фільтри змінились, і вибраної клітинки вже немає
+
+    c1, c2 = st.columns(2)
+    cat = c1.selectbox("Категорія", cats, index=None, key="cmp_heat_cat", format_func=lambda c: CAT_LABEL[c],
+                       placeholder="Клікніть клітинку на карті або оберіть тут")
+    period = c2.selectbox("Півріччя", periods, index=None, key="cmp_heat_period",
+                          placeholder="Клікніть клітинку на карті або оберіть тут")
+    if not (cat and period):
+        st.caption("Клікніть клітинку, щоб побачити статті обох джерел, з яких складено її колір.")
+        return
+    rows = cmp.cell_articles(df, cat, period)
+    st.markdown(f"**{CAT_LABEL[cat]} · {period}**: статей {len(rows)}")
+    cols = st.columns(2)
+    for col, src in zip(cols, cmp.SOURCES):
+        part = rows[rows["source"] == src]
+        with col:
+            badge = ":blue-badge[BBC]" if src == cmp.BBC else ":orange-badge[Радіо Свобода]"
+            avg = "" if part.empty else f" · середня {part['score'].mean():+.2f}"
+            st.markdown(f"{badge} статей {len(part)}{avg}")
+            if part.empty:
+                st.caption("У цій клітинці немає статей цього джерела.")
+            for _, r in part.iterrows():
+                _cmp_article_card(r)
+
+
+@st.fragment
+def cmp_distribution_section(df: pd.DataFrame, arts: pd.DataFrame) -> None:
+    scope = st.segmented_control("Що показати", [cmp.SCOPE_CATEGORIES, cmp.SCOPE_OVERALL],
+                                 default=cmp.SCOPE_CATEGORIES, key="cmp_scope") or cmp.SCOPE_CATEGORIES
+    st.plotly_chart(cmp.distribution_figure(df, arts, scope), width="stretch", config=PLOT_CONFIG)
+    st.caption("Ліворуч BBC, праворуч Радіо Свобода; пунктир — середня оцінка.")
+    ca, cb = st.columns([3, 2])
+    ca.markdown("**Склад тону за роками**")
+    ca.plotly_chart(cmp.stance_figure(arts), width="stretch", config=PLOT_CONFIG)
+    cb.markdown("**Частка статей, орієнтованих на компроміс**")
+    cb.plotly_chart(cmp.compromise_year_figure(arts), width="stretch", config=PLOT_CONFIG)
+    st.caption(f"Клас тону: ескалація ≤ −{cmp.STANCE_THRESHOLD}, компроміс ≥ +{cmp.STANCE_THRESHOLD}, "
+               "решта — нейтрально.")
+
+
+@st.fragment
+def cmp_summary_section() -> None:
+    summaries = load_summaries()
+    summaries = summaries[summaries["source"].isin(cmp.SOURCES)]
+    if summaries.empty:
+        st.info("Резюме ще не згенеровано.", icon=":material/info:")
+        return
+    periods = sorted(summaries["period"].unique())
+    period = st.select_slider("Півріччя", options=periods, value=periods[-1], key="cmp_period")
+    st.plotly_chart(cmp.summary_timeline_figure(summaries, period), width="stretch", config=PLOT_CONFIG)
+    st.caption("Резюме створює агент для всього півріччя; вони не залежать від фільтрів у бічній панелі.")
+    annotations = load_annotations()
+    for col, src in zip(st.columns(2), cmp.SOURCES):
+        row = summaries[(summaries["period"] == period) & (summaries["source"] == src)]
+        with col:
+            if row.empty:
+                st.info(f"Для {SOURCE_LABELS[src]} у цьому півріччі резюме немає.", icon=":material/info:")
+                continue
+            row = row.iloc[0]
+            selected = annotations[(annotations["period"] == period) & (annotations["source"] == src)]
+            _summary_card(row, selected)
+
+
+def compare_page() -> None:
+    st.title(":material/compare_arrows: BBC та Радіо Свобода")
+    df, arts = current_filtered_data()
+    if df.empty:
+        empty_state()
+        return
+    if not set(cmp.SOURCES) <= set(arts["source"]):
+        st.info("Для порівняння потрібні два джерела. Оберіть два будь-яких джерела (напр. BBC і Радіо Свобода) у фільтрі «Джерела» "
+                "в бічній панелі.", icon=":material/compare_arrows:")
+        return
+    df, arts = cmp.add_period(df), cmp.add_period(arts)
+    st.caption(CMP_DISCLAIMER)
+
+    metrics = cmp.head_to_head(df, arts)
+    st.markdown(_cmp_card_css(), unsafe_allow_html=True)
+    cols = st.columns(len(metrics) + 1)
+    for idx, (col, metric) in enumerate(zip(cols, metrics)):
+        _cmp_metric_card(col, idx, metric)
+    _cmp_correlation_card(cols[-1], arts)
+
+    notes = cmp.highlights(df, arts)
+    if notes:
+        with st.container(border=True):
+            st.markdown("**Головне**")
+            for note in notes:
+                st.markdown(f"- {note}")
+
+    t_trend, t_cat, t_heat, t_dist, t_sum = st.tabs([
+        ":material/show_chart: Динаміка",
+        ":material/radar: Категорії",
+        ":material/grid_on: Теплова карта",
+        ":material/stacked_bar_chart: Розподіли",
+        ":material/menu_book: Півріччя поруч",
+    ])
+    with t_trend:
+        cmp_trend_section(arts)
+    with t_cat:
+        cmp_category_section(df)
+    with t_heat:
+        cmp_heatmap_section(df)
+    with t_dist:
+        cmp_distribution_section(df, arts)
+    with t_sum:
+        cmp_summary_section()
 
 
 def articles_page() -> None:
@@ -671,12 +1008,16 @@ def _run_action(action, *args, ok_msg: str, icon: str = "✅") -> None:
 
 def new_note_form(user: dict) -> None:
     today = utc_now().date()
+    sources = get_filter_options()["sources"] or ["bbc"]
     with st.expander("Нова замітка", icon=":material/add:"):
         with st.form("new_note_form", border=False, clear_on_submit=True):
-            c1, c2 = st.columns(2)
+            c1, c2, c3 = st.columns(3)
             event_date = c1.date_input("Дата події (UTC)", value=today, min_value=WAR_START,
                                        max_value=today, format="DD.MM.YYYY", key="nn_date")
             cat = c2.selectbox("Категорія", CATEGORIES, format_func=CAT_LABEL.get, key="nn_cat")
+            source = c3.selectbox(
+                "Джерело", sources, format_func=lambda value: SOURCE_LABELS.get(value, value), key="nn_source"
+            )
             imp = st.segmented_control(
                 "Тип", list(IMPORTANCE_TYPES), default="COMMENT", key="nn_imp",
                 format_func=lambda x: "Коментар" if x == "COMMENT" else "Офіційна заява",
@@ -685,7 +1026,7 @@ def new_note_form(user: dict) -> None:
                                    placeholder="Що сталося і чому це важливо для динаміки переговорів…")
             submitted = st.form_submit_button("Додати замітку", type="primary", icon=":material/save:")
         if submitted:
-            _run_action(create_note, user["id"], event_date.isoformat(), cat, content, imp,
+            _run_action(create_note, user["id"], event_date.isoformat(), cat, content, imp, source,
                         ok_msg="Замітку збережено")
 
 
@@ -708,6 +1049,7 @@ def _note_card(note: pd.Series, user: dict) -> None:
         st.markdown(
             f"**{pd.to_datetime(note['event_date']):%d.%m.%Y}** &nbsp; "
             f":gray-badge[{CAT_LABEL.get(note['metric_category'], note['metric_category'])}] "
+            f":gray-badge[{SOURCE_LABELS.get(note['source'], note['source'])}] "
             f"{IMPORTANCE_BADGE.get(note['importance_type'], '')} {STATUS_BADGE.get(note['status'], note['status'])} "
             f"{REVIEW_BADGE.get(note['review_status'], '')}"
         )
@@ -748,7 +1090,7 @@ def notes_page() -> None:
     
     with selected_tab[0]:
         new_note_form(user)
-        notes = load_expert_notes(f["start"], f["end"], f["categories"])
+        notes = load_expert_notes(f["start"], f["end"], f["categories"], sources=f["sources"])
         is_admin = user["role"] == "Admin"
         # Активні бачать усі; архівні — лише автор (та Admin)
         visible = notes[(notes["status"] == ACTIVE) | (notes["author_id"] == user["id"]) | is_admin]
@@ -791,12 +1133,16 @@ def _agent_summaries() -> None:
         return
     annotations = load_annotations()
     for _, row in summaries.iterrows():
-        _summary_card(row, annotations[annotations["period"] == row["period"]])
+        selected = annotations[
+            (annotations["period"] == row["period"]) & (annotations["source"] == row["source"])
+        ]
+        _summary_card(row, selected)
 
 
 def _summary_card(row: pd.Series, annotations: pd.DataFrame) -> None:
     with st.container(border=True):
-        st.markdown(f"### {row['period']} &nbsp; {TREND_BADGE.get(row['trend'], row['trend'])}")
+        source = SOURCE_LABELS.get(row["source"], row["source"])
+        st.markdown(f"### {source} · {row['period']} &nbsp; {TREND_BADGE.get(row['trend'], row['trend'])}")
         st.write(row["summary"])
         for _, a in annotations.iterrows():
             mark = ":green[▲ пік]" if a["kind"] == "peak" else ":red[▼ спад]"
@@ -847,6 +1193,7 @@ def main() -> None:
     bootstrap()
     pages = [
         st.Page(dashboard_page, title="Огляд", icon=":material/monitoring:", url_path="overview", default=True),
+        st.Page(compare_page, title="Порівняння", icon=":material/compare_arrows:", url_path="compare"),
         st.Page(articles_page, title="Статті", icon=":material/article:", url_path="articles"),
         st.Page(notes_page, title="Замітки", icon=":material/edit_note:", url_path="notes"),
         st.Page(summary_page, title="Підсумки", icon=":material/summarize:", url_path="summary"),
